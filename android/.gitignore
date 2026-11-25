@@ -10,3 +10,5 @@ captures/
 .cxx/
 *.keystore
 *.jks
+# Android Studio lo genera con su JDK; fijaría ese JDK también en Jenkins.
+gradle/gradle-daemon-jvm.properties
