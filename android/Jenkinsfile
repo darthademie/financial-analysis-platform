@@ -1,0 +1,183 @@
+// Pipeline de la app Android. En el job de Jenkins, «Script Path» = android/Jenkinsfile.
+// El repositorio completo hace falta: Gradle empaqueta en el APK el código de ../app (backend Python e interfaz).
+pipeline {
+    agent any
+
+    environment {
+        GH_TOKEN_CREDS = 'github-darthademie'
+        TAG = "1.${env.BUILD_NUMBER}"
+        GH_REPO = 'darthademie/financial-analysis-platform'
+        GH_BRANCH = 'android'
+        BUILD_GRADLE = 'android/app/build.gradle.kts'
+        APK_PATH = 'android/app/build/outputs/apk/debug/app-debug.apk'
+    }
+
+    stages {
+        stage('1. Obtener Código') {
+            steps {
+                echo 'Descargando código fuente...'
+                git branch: "${GH_BRANCH}", url: "https://github.com/${GH_REPO}.git"
+            }
+        }
+
+        stage('Pipeline Principal (CI/CD)') {
+            when {
+                expression {
+                    // 1. Comprobamos si el pipeline se ha lanzado manualmente (por un usuario dándole al botón)
+                    def isManualTrigger = currentBuild.rawBuild.getCauses().any { cause ->
+                        cause instanceof hudson.model.Cause.UserIdCause
+                    }
+
+                    // Si se ha lanzado a mano, saltamos la comprobación y permitimos la ejecución
+                    if (isManualTrigger) {
+                        echo "[INFO] Compilación lanzada MANUALMENTE. Ignorando comprobación de '[skip ci]'."
+                        return true
+                    }
+
+                    // 2. Si NO ha sido manual (ej: viene de un Webhook de GitHub), comprobamos el commit
+                    def commitMessage = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+                    if (commitMessage.contains('[skip ci]')) {
+                        echo "Se ha detectado '[skip ci]' desde un evento automático. Abortando ejecución."
+                        currentBuild.result = 'ABORTED'
+                        return false
+                    }
+
+                    // Si no es manual y no tiene '[skip ci]', permitimos la ejecución
+                    return true
+                }
+            }
+            stages {
+                stage('2. Pruebas del backend en modo Android') {
+                    steps {
+                        // Pasa tests/ y android/tests/ contra el sustituto de FastAPI/Pydantic que va en el APK,
+                        // sin FastAPI instalado: si un cambio de app/main.py no lo soporta, falla aquí y no en el móvil.
+                        echo 'Ejecutando las pruebas de Python contra el sustituto de FastAPI...'
+                        sh """
+                        tar -cf - --exclude=.git . | docker run --rm -i -e PYTHONDONTWRITEBYTECODE=1 python:3.12-slim sh -c "
+                            set -e
+                            mkdir -p /workspace && cd /workspace
+                            tar -xf -
+                            pip install -q --disable-pip-version-check --root-user-action=ignore openpyxl==3.1.5 xlrd==2.0.2 defusedxml==0.7.1 xlwt pytest
+                            export PYTHONPATH=/workspace/android/app/src/main/python
+                            python -m pytest -q -p no:cacheprovider tests
+                            python -m pytest -q -p no:cacheprovider android/tests
+                        "
+                        """
+                    }
+                }
+
+                stage('3. Actualizar Versión (GitOps)') {
+                    steps {
+                        echo "Actualizando versionCode y versionName en ${BUILD_GRADLE}..."
+                        withCredentials([usernamePassword(credentialsId: env.GH_TOKEN_CREDS, usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')]) {
+                            sh """
+                            # 1. Configurar identidad de Git
+                            git config --global user.email "jenkins@teleupm.com"
+                            git config --global user.name "Jenkins CI"
+
+                            # 2. Inyectar la nueva versión usando sed (sintaxis Kotlin DSL: versionCode = 1)
+                            sed -i -E "s/versionCode = [0-9]+/versionCode = ${env.BUILD_NUMBER}/g" ${BUILD_GRADLE}
+                            sed -i -E "s/versionName = \\"[^\\"]+\\"/versionName = \\"${TAG}\\"/g" ${BUILD_GRADLE}
+
+                            # 3. Hacer Commit y Push al repositorio con la etiqueta mágica
+                            git add ${BUILD_GRADLE}
+                            git commit -m "gitops: Despliegue automático de versión ${TAG} [skip ci]" || echo "No hay cambios"
+                            git push https://\${GH_USER}:\${GH_TOKEN}@github.com/${GH_REPO}.git HEAD:${GH_BRANCH}
+                            """
+                        }
+                    }
+                }
+
+                stage('4. Construir APK (Android SDK)') {
+                    steps {
+                        // La imagen no necesita Python ni Node: Gradle descarga Chaquopy, el intérprete de Python
+                        // y las librerías Python puras (con su SHA-256), y copia ../app al APK.
+                        echo 'Levantando contenedor con SDK de Android y compilando...'
+                        sh """
+                        docker rm -f android-builder || true
+                        tar -cf - --exclude=.git . | docker run --name android-builder -i mingc/android-build-box:latest bash -c "
+                            set -e
+                            mkdir -p /workspace && cd /workspace
+                            tar -xf -
+                            cd android
+                            chmod +x ./gradlew
+                            ./gradlew --no-daemon assembleDebug lintDebug
+                        "
+                        """
+                    }
+                    post {
+                        always {
+                            echo 'Extrayendo APK y el informe de lint del contenedor...'
+                            sh """
+                            docker cp android-builder:/workspace/${APK_PATH} ./app-debug.apk || true
+                            docker cp android-builder:/workspace/android/app/build/reports/lint-results-debug.html ./lint-results-debug.html || true
+                            docker rm android-builder || true
+                            """
+                            archiveArtifacts artifacts: 'app-debug.apk, lint-results-debug.html', allowEmptyArchive: true
+                        }
+                    }
+                }
+
+                stage('5. Análisis de Seguridad (MAST Blackbox)') {
+                    steps {
+                        echo 'Analizando el APK en busca de secretos, URIs y vulnerabilidades...'
+                        sh """
+                        docker rm -f apk-scanner || true
+                        tar -cf - app-debug.apk | docker run --name apk-scanner -i python:3.9-alpine sh -c "
+                            apk add --no-cache openjdk11-jre unzip git wget
+                            pip install apkleaks
+
+                            mkdir -p /workspace && cd /workspace
+                            tar -xf -
+
+                            yes | apkleaks -f app-debug.apk -o /reporte-mast.txt || true
+                        "
+                        """
+                    }
+                    post {
+                        always {
+                            echo 'Extrayendo informe de seguridad...'
+                            sh """
+                            docker cp apk-scanner:/reporte-mast.txt ./reporte-mast.txt || true
+                            docker rm apk-scanner || true
+                            """
+                            archiveArtifacts artifacts: 'reporte-mast.txt', allowEmptyArchive: true
+                        }
+                    }
+                }
+
+                stage('6. Publicar en GitHub Releases') {
+                    steps {
+                        echo 'Creando Release en GitHub y subiendo el APK...'
+                        withCredentials([usernamePassword(credentialsId: env.GH_TOKEN_CREDS, usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')]) {
+                            sh """
+                            tar -cf - app-debug.apk | docker run --rm -i -e GH_TOKEN=\${GH_TOKEN} alpine:latest sh -c "
+                                apk add --no-cache github-cli && \\
+                                tar -xf - && \\
+                                gh release create v${TAG} app-debug.apk \\
+                                    --repo ${GH_REPO} \\
+                                    --target ${GH_BRANCH} \\
+                                    --prerelease \\
+                                    --title 'Versión de Desarrollo Android v${TAG}' \\
+                                    --notes 'APK autogenerado por Jenkins CI (Debug Build) desde la rama ${GH_BRANCH}'
+                            "
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo 'Limpiando el workspace de Jenkins...'
+            cleanWs()
+        }
+        success {
+            echo "[INFO] Pipeline de Android completado con éxito. Nueva release v${TAG} publicada."
+        }
+        failure {
+            echo "[ERROR] El pipeline ha fallado. Revisa la consola para ver los detalles."
+        }
+    }
+}

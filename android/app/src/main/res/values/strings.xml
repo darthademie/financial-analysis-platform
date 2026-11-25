@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Finanzas</string>
+    <string name="webview_too_old">Esta versión de Android System WebView es demasiado antigua. Actualízala desde Google Play y vuelve a abrir la aplicación.</string>
+    <string name="file_saved">Fichero guardado.</string>
+    <string name="save_failed">No se ha podido guardar el fichero.</string>
+    <string name="save_unavailable">No hay ninguna aplicación para guardar ficheros.</string>
+</resources>

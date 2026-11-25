@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Tema claro u oscuro según el sistema: el WebView lo usa para prefers-color-scheme. -->
+    <style name="Theme.Finanzas" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+        <item name="android:windowBackground">@color/page</item>
+    </style>
+</resources>
