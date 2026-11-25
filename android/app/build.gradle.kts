@@ -20,8 +20,8 @@ android {
         applicationId = "es.finanzas.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 3
+        versionName = "1.3"
         ndk {
             // Python 3.12 en Chaquopy solo existe para 64 bits.
             abiFilters += listOf("arm64-v8a", "x86_64")
