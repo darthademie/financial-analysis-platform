@@ -4,7 +4,7 @@ pipeline {
     agent any
 
     environment {
-        GH_TOKEN_CREDS = 'github-darthademie'
+        GH_TOKEN_CREDS = 'github-darthademie-financial-app'
         TAG = "1.${env.BUILD_NUMBER}"
         GH_REPO = 'darthademie/financial-analysis-platform'
         GH_BRANCH = 'android'
